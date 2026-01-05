@@ -52,14 +52,14 @@ pub async fn create_signed_tx(
     body.encode(&mut body_bytes)?;
     
     // 5. AuthInfo
-    // PubKey (Revert to Cosmos Secp256k1 to pass parsing)
+    // PubKey (Use Ethermint EthSecp256k1 to pass parsing for ETH-style accounts)
     let pub_key_bytes = wallet.signer().verifying_key().to_sec1_bytes().to_vec(); // 33 bytes compressed
-    let secp_pub = crate::proto::cosmos::crypto::secp256k1::PubKey { key: pub_key_bytes };
+    let eth_pub = crate::proto::ethermint::crypto::v1::ethsecp256k1::PubKey { key: pub_key_bytes };
     let mut pub_key_any_bytes = Vec::new();
-    secp_pub.encode(&mut pub_key_any_bytes)?;
+    eth_pub.encode(&mut pub_key_any_bytes)?;
     
     let pub_key_any = Any {
-        type_url: "/cosmos.crypto.secp256k1.PubKey".to_string(),
+        type_url: "/ethermint.crypto.v1.ethsecp256k1.PubKey".to_string(),
         value: pub_key_any_bytes,
     };
     

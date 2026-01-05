@@ -36,6 +36,18 @@ struct RestAccountResponse {
 }
 
 #[derive(serde::Deserialize)]
+pub struct TxResponse {
+    pub code: u32,
+    pub txhash: String,
+    pub raw_log: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BroadcastResponse {
+    pub tx_response: TxResponse,
+}
+
+#[derive(serde::Deserialize)]
 struct RestAccountData {
     #[serde(default)]
     account_number: String,
@@ -171,6 +183,15 @@ impl GreenfieldClient {
         
         if !status.is_success() {
              return Err(format!("Broadcast failed with status {}: {}", status, text).into());
+        }
+
+        let resp_data: BroadcastResponse = serde_json::from_str(&text)?;
+        if resp_data.tx_response.code != 0 {
+            return Err(format!(
+                "Tx Failed (Code {}): {}", 
+                resp_data.tx_response.code, 
+                resp_data.tx_response.raw_log
+            ).into());
         }
 
         Ok(text)
