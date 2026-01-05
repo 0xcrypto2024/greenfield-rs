@@ -1,0 +1,36 @@
+[package]
+name = "greenfield_rs"
+version = "0.3.0"
+edition = "2021"
+description = "Rust SDK and CLI for BNB Greenfield decentralized storage"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.32", features = ["full"] }
+
+# gRPC & Protobuf
+tonic = { version = "0.10", features = ["transport", "tls", "tls-roots"] }
+prost = "0.12"
+prost-types = "0.12"
+
+# HTTP (for Phase 2/3)
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+base64 = "0.21"
+
+# Ethereum/EIP-712 (Phase 2)
+ethers = { version = "2.0", features = ["ws", "rustls", "abigen"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive", "env"] }
+rand = "0.8"
+chrono = "0.4"
+md-5 = "0.10"
+dotenv = "0.15"
+eth-keystore = "0.5"
+uuid = { version = "1.0", features = ["v4"] }
+rpassword = "7.3"
+
+[build-dependencies]
+tonic-build = "0.10"

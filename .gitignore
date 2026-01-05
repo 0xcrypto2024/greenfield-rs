@@ -1,0 +1,32 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Sensitive files
+keystore.json
+password.txt
+*.key
+*.pem
+
+# Test files
+test_*.txt
+
+# Dependencies (vendored, don't need to commit)
+# Uncomment if you want to exclude deps from git:
+# /deps/greenfield-storage-provider/
+# /deps/greenfield-common/
+
+# OS
+.DS_Store
+Thumbs.db
