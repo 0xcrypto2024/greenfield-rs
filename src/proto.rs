@@ -50,7 +50,7 @@ pub mod cosmos {
             }
         }
     }
-   pub mod crypto {
+    pub mod crypto {
         pub mod multisig {
             pub mod v1beta1 {
                 tonic::include_proto!("cosmos.crypto.multisig.v1beta1");
@@ -59,6 +59,9 @@ pub mod cosmos {
         pub mod secp256k1 {
             tonic::include_proto!("cosmos.crypto.secp256k1");
         }
+        pub mod ethsecp256k1 {
+            tonic::include_proto!("cosmos.crypto.ethsecp256k1");
+        }
     }
 }
 
@@ -66,7 +69,7 @@ pub mod ethermint {
     pub mod crypto {
         pub mod v1 {
             pub mod ethsecp256k1 {
-                 tonic::include_proto!("ethermint.crypto.v1.ethsecp256k1");
+                tonic::include_proto!("ethermint.crypto.v1.ethsecp256k1");
             }
         }
     }

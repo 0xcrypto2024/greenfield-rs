@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use ethers::signers::{LocalWallet, Signer};
-use greenfield_rs::GreenfieldClient;
+use greenfield_rs::{extract_eip155_chain_id, GreenfieldClient};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -20,12 +20,15 @@ struct Cli {
     keystore: Option<PathBuf>,
 
     /// RPC URL (REST)
-    #[arg(long, default_value = "https://gnfd-testnet-fullnode-tendermint-us.bnbchain.org")]
+    #[arg(
+        long,
+        default_value = "https://gnfd-testnet-fullnode-tendermint-us.bnbchain.org"
+    )]
     rpc_url: String,
 
-    /// Chain ID
-    #[arg(long, default_value_t = 5600)]
-    chain_id: u64,
+    /// Chain ID (e.g., "greenfield_5600-1" for testnet, "greenfield_1017-1" for mainnet)
+    #[arg(long, default_value = "greenfield_5600-1")]
+    chain_id: String,
 }
 
 #[derive(Subcommand)]
@@ -89,7 +92,7 @@ enum Commands {
         /// Use mainnet instead of testnet
         #[arg(long, default_value_t = false)]
         mainnet: bool,
-    }
+    },
 }
 
 #[tokio::main]
@@ -99,8 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle commands that don't need a wallet first
     match &cli.command {
         Commands::GenerateKey { output } => {
-            use rand::RngCore;
             use eth_keystore::encrypt_key;
+            use rand::RngCore;
             use std::io::Write;
 
             println!("🔐 Generating new wallet...\n");
@@ -136,13 +139,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Get the directory and filename
             let dir = output.parent().unwrap_or(std::path::Path::new("."));
-            let name = output.file_stem()
+            let name = output
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("keystore");
 
             // Encrypt and save keystore
             let uuid = encrypt_key(dir, &mut rng, &private_key, &password, Some(name))?;
-            
+
             println!("\n✅ Keystore saved!");
             println!("   File: {}", output.display());
             println!("   UUID: {}", uuid);
@@ -150,11 +154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("   The keystore file alone is not enough to recover your wallet.");
 
             return Ok(());
-        },
+        }
         _ => {}
     }
 
     // Commands that require a wallet
+    // Extract EIP-155 chain ID for wallet (Ethereum signing uses numeric ID)
+    let eip155_chain_id = extract_eip155_chain_id(&cli.chain_id)?;
+
     let wallet = if let Some(keystore_path) = &cli.keystore {
         // Load from keystore file
         if !keystore_path.exists() {
@@ -166,9 +173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to decrypt keystore: {:?}", e))?;
         let wallet = LocalWallet::from_bytes(&decrypted)
             .map_err(|e| format!("Failed to create wallet from keystore: {:?}", e))?;
-        wallet.with_chain_id(cli.chain_id)
+        wallet.with_chain_id(eip155_chain_id)
     } else if let Some(pk) = &cli.private_key {
-        LocalWallet::from_str(pk)?.with_chain_id(cli.chain_id)
+        LocalWallet::from_str(pk)?.with_chain_id(eip155_chain_id)
     } else {
         return Err("Wallet required. Use --keystore <path> or --private-key <hex>".into());
     };
@@ -176,27 +183,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔑 Wallet: {:?}", wallet.address());
 
     let client = GreenfieldClient::new(
-        wallet, 
+        wallet,
         cli.rpc_url.clone(),
         cli.rpc_url,
-        cli.chain_id
+        cli.chain_id.clone(),
     );
 
     match cli.command {
         Commands::GenerateKey { .. } => unreachable!(), // Already handled above
-        Commands::Upload { sp_url, bucket, object, file, visibility } => {
+        Commands::Upload {
+            sp_url,
+            bucket,
+            object,
+            file,
+            visibility,
+        } => {
             if !file.exists() {
                 return Err("File does not exist".into());
             }
             println!("🚀 Starting unified upload for {}...", file.display());
             let file_path = file.to_string_lossy().to_string();
-            
-            match client.upload(&sp_url, bucket, object, file_path, visibility).await {
+
+            match client
+                .upload(&sp_url, bucket, object, file_path, visibility)
+                .await
+            {
                 Ok(res) => println!("✅ Upload completed: {}", res),
                 Err(e) => println!("❌ Upload failed: {}", e),
             }
-        },
-        Commands::CreateObject { bucket, object, file, visibility } => {
+        }
+        Commands::CreateObject {
+            bucket,
+            object,
+            file,
+            visibility,
+        } => {
             if !file.exists() {
                 return Err("File does not exist".into());
             }
@@ -204,26 +225,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let content_type = "application/octet-stream".to_string();
 
             println!("Creating Object: {}/{} ({} bytes)...", bucket, object, size);
-            
-            let res = client.create_object(bucket, object, size, content_type, visibility).await?;
+
+            let res = client
+                .create_object(bucket, object, size, content_type, visibility)
+                .await?;
             println!("Response: {}", res);
-        },
+        }
         Commands::ImportKey { .. } => {
             println!("Import key feature not yet re-integrated in this refactor.");
-        },
-        Commands::PutObject { sp_url, bucket, object, file } => {
+        }
+        Commands::PutObject {
+            sp_url,
+            bucket,
+            object,
+            file,
+        } => {
             if !file.exists() {
                 return Err("File does not exist".into());
             }
-            println!("Uploading {} to {}/{} via {}...", file.display(), bucket, object, sp_url);
-            
+            println!(
+                "Uploading {} to {}/{} via {}...",
+                file.display(),
+                bucket,
+                object,
+                sp_url
+            );
+
             let file_path = file.to_string_lossy().to_string();
             match client.put_object(&sp_url, bucket, object, file_path).await {
                 Ok(res) => println!("Upload Response: {}", res),
                 Err(e) => println!("Upload Error: {}", e),
             }
-        },
-        Commands::TransferOut { bsc_rpc, amount, mainnet } => {
+        }
+        Commands::TransferOut {
+            bsc_rpc,
+            amount,
+            mainnet,
+        } => {
             println!("🚀 Initiating BSC -> Greenfield bridge transfer...");
             match client.transfer_out(&bsc_rpc, &amount, mainnet).await {
                 Ok(tx_hash) => println!("✅ Bridge transfer initiated! TX: {}", tx_hash),

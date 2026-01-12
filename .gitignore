@@ -26,7 +26,15 @@ test_*.txt
 # Uncomment if you want to exclude deps from git:
 # /deps/greenfield-storage-provider/
 # /deps/greenfield-common/
+# /deps/greenfield-go-sdk/
+# /deps/hellogreenfield/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs and scratchpads
+*.txt
+log.txt
+convert.rs
+bin/
