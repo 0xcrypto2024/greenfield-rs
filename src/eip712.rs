@@ -2,13 +2,17 @@ use ethers::types::H256;
 use ethers::utils::keccak256;
 use serde::{Deserialize, Serialize};
 
+// ============================================================================
+// Data Structs
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
     pub account_number: String,
     pub chain_id: String,
     pub fee: Fee,
     pub memo: String,
-    // ✅ 必须是 msg1，且从 1 开始计数
+    // Must be msg1, 1-indexed
     pub msg1: TypeCreateObject,
     pub sequence: String,
     pub timeout_height: String,
@@ -93,7 +97,7 @@ pub type MsgValue = TypeCreateObject;
 pub struct TypeMsg1PrimarySpApproval {
     pub expired_height: String,
     pub global_virtual_group_family_id: String, // Must be String for EIP-712 JSON
-                                                // ✅ 无 sig
+                                                // No sig field
 }
 
 // Alias PrimarySpApproval to TypeMsg1PrimarySpApproval for compatibility
@@ -133,7 +137,7 @@ impl Coin {
 
 impl Fee {
     pub fn get_type_hash() -> H256 {
-        // ✅ 必须包含 gas_limit, granter, payer
+        // Must include gas_limit, granter, payer
         let type_str = "Fee(Coin[] amount,uint256 gas_limit,string granter,string payer)Coin(uint256 amount,string denom)";
         H256::from(keccak256(type_str.as_bytes()))
     }
@@ -190,7 +194,8 @@ impl TypeMsg1PrimarySpApproval {
 
         let mut gvg_bytes = [0u8; 32];
         // u32 is 4 bytes.
-        let val_bytes = self.global_virtual_group_family_id.to_be_bytes();
+        let val: u32 = self.global_virtual_group_family_id.parse().unwrap_or(0);
+        let val_bytes = val.to_be_bytes();
         gvg_bytes[28..32].copy_from_slice(&val_bytes);
         encoded.extend_from_slice(&gvg_bytes);
         H256::from(keccak256(&encoded))
@@ -312,7 +317,7 @@ impl Tx {
         let fee = "Fee(Coin[] amount,uint256 gas_limit,string granter,string payer)";
         let msg_val = "Msg1(string bucket_name,string content_type,string creator,string[] expect_checksums,string object_name,uint256 payload_size,TypePrimarySpApproval primary_sp_approval,string redundancy_type,string type,string visibility)";
         let psa =
-            "TypePrimarySpApproval(uint256 expired_height,uint256 global_virtual_group_family_id)";
+            "TypeMsg1PrimarySpApproval(uint64 expired_height,uint32 global_virtual_group_family_id)";
         (
             tx.into(),
             coin.into(),
@@ -324,8 +329,8 @@ impl Tx {
     }
     pub fn get_type_hash() -> H256 {
         let (tx, coin, fee, msg_val, psa, _) = Self::get_component_type_strs();
-        // ✅ 严格按照字母顺序连接用于计算 TypeHash (Coin, Fee, Msg1, TypePrimarySpApproval, Tx)
-        // 注意：顺序必须与 Greenfield 源码中的 extractMsgTypes 递归生成的一致
+        // Must concatenate in strict alphabetical order for TypeHash (Coin, Fee, Msg1, TypePrimarySpApproval, Tx)
+        // Note: Order must match extractMsgTypes recursive generation in Greenfield source
         let type_str = format!("{}{}{}{}{}", tx, coin, fee, msg_val, psa);
         H256::from(keccak256(type_str.as_bytes()))
     }
@@ -337,17 +342,22 @@ impl Tx {
         let mut acc_bytes = [0u8; 32];
         acc_bytes[24..32].copy_from_slice(&acc_num.to_be_bytes());
         encoded.extend_from_slice(&acc_bytes);
-        let cid_num: u64 = 5600;
+
+        // Fix: parse chain_id from self.chain_id instead of hardcoded 5600
+        let cid_num: u64 = self.chain_id.parse()?;
         let mut cid_bytes = [0u8; 32];
         cid_bytes[24..32].copy_from_slice(&cid_num.to_be_bytes());
         encoded.extend_from_slice(&cid_bytes);
+
         encoded.extend_from_slice(self.fee.get_struct_hash().as_bytes());
         encoded.extend_from_slice(&keccak256(self.memo.as_bytes()));
         encoded.extend_from_slice(self.msg1.get_struct_hash().as_bytes());
+
         let seq: u64 = self.sequence.parse()?;
         let mut seq_bytes = [0u8; 32];
         seq_bytes[24..32].copy_from_slice(&seq.to_be_bytes());
         encoded.extend_from_slice(&seq_bytes);
+
         let timeout: u64 = self.timeout_height.parse().unwrap_or(0);
         let mut timeout_bytes = [0u8; 32];
         timeout_bytes[24..32].copy_from_slice(&timeout.to_be_bytes());

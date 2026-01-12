@@ -108,7 +108,7 @@ impl GreenfieldClient {
         content_type: String,
         visibility: i32,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let address = self.wallet.address();
+        let _address = self.wallet.address();
 
         // 1. 定义枚举（必须能转为 Greenfield 期待的字符串全称）
         let visibility_enum = match visibility {
