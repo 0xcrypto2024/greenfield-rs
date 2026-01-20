@@ -102,6 +102,33 @@ impl GreenfieldClient {
         })
     }
 
+    /// Create object metadata on-chain with file checksums
+    /// This is the full implementation matching Go SDK's CreateObject
+    pub async fn create_object_with_file(
+        &self,
+        bucket_name: String,
+        object_name: String,
+        file_path: &str,
+        content_type: String,
+        visibility: i32,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // 1. Compute integrity hashes from file (like Go SDK's ComputeHashRoots)
+        println!("DEBUG: Computing integrity hashes for file: {}", file_path);
+        let (checksums, file_size) = crate::hash::compute_hash_from_file_default(file_path)?;
+        println!("DEBUG: Computed {} checksums, file size: {} bytes", checksums.len(), file_size);
+        
+        // Create object with computed checksums
+        self.create_object_internal(
+            bucket_name,
+            object_name,
+            file_size,
+            content_type,
+            visibility,
+            checksums,
+        ).await
+    }
+
+    /// Create object with pre-computed checksums (for advanced use)
     pub async fn create_object(
         &self,
         bucket_name: String,
@@ -110,15 +137,42 @@ impl GreenfieldClient {
         content_type: String,
         visibility: i32,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // For backward compatibility - compute checksums if file size is small enough
+        // Otherwise, caller should use create_object_with_file
+        
+        // Create placeholder checksums (7 empty hashes) - this will fail on-chain validation
+        // but allows testing EIP-712 signing
+        println!("WARNING: create_object called without checksums - using empty checksums (will fail on chain)");
+        let empty_checksums: Vec<Vec<u8>> = vec![];
+        
+        self.create_object_internal(
+            bucket_name,
+            object_name,
+            payload_size,
+            content_type,
+            visibility,
+            empty_checksums,
+        ).await
+    }
+
+    /// Internal implementation of create_object
+    async fn create_object_internal(
+        &self,
+        bucket_name: String,
+        object_name: String,
+        payload_size: u64,
+        content_type: String,
+        visibility: i32,
+        checksums: Vec<Vec<u8>>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let _address = self.wallet.address();
 
-        // 1. Fetch bucket info to get correct global_virtual_group_family_id
-        println!("DEBUG: Fetching bucket info for '{}'...", bucket_name);
-        let bucket_info = crate::bucket::get_bucket_info(&self.rpc_url, &bucket_name).await?;
-        let gvg_family_id = bucket_info.global_virtual_group_family_id;
-        println!("DEBUG: Got global_virtual_group_family_id: {}", gvg_family_id);
+        // Note: For MsgCreateObject, GlobalVirtualGroupFamilyId should be 0 (not from bucket)
+        // Go SDK's NewMsgCreateObject only sets ExpiredHeight and Sig in PrimarySpApproval
+        // The GlobalVirtualGroupFamilyId defaults to 0 (Go struct zero value)
+        println!("DEBUG: Creating object '{}' in bucket '{}'...", object_name, bucket_name);
 
-        // 2. 定义枚举（必须能转为 Greenfield 期待的字符串全称）
+        // Define visibility enum
         let visibility_enum = match visibility {
             1 => crate::eip712::Visibility::Public,
             2 => crate::eip712::Visibility::Private,
@@ -126,21 +180,23 @@ impl GreenfieldClient {
             _ => crate::eip712::Visibility::Public,
         };
 
-        // Approval with correct gvg_family_id from bucket info
+        // IMPORTANT: For MsgCreateObject, PrimarySpApproval.GlobalVirtualGroupFamilyId = 0
+        // This is different from MsgCreateBucket which needs the actual VGF ID
+        // See Go SDK: storageTypes.NewMsgCreateObject only sets ExpiredHeight & Sig
         let proto_approval = ProtoApproval {
-            expired_height: 18446744073709551615,
-            global_virtual_group_family_id: gvg_family_id,
+            expired_height: u64::MAX,  // math.MaxUint in Go
+            global_virtual_group_family_id: 0,  // Must be 0 for CreateObject!
             sig: vec![],
         };
         let eip_approval = Eip712Approval {
-            expired_height: "18446744073709551615".to_string(),
-            global_virtual_group_family_id: gvg_family_id.to_string(),
+            expired_height: u64::MAX.to_string(),
+            global_virtual_group_family_id: "0".to_string(),  // Must be 0 for CreateObject!
         };
 
-        // IMPORTANT: Proto and EIP-712 must use the SAME checksums!
-        // Using empty array for now (SP will calculate checksums)
-        let checksums_proto: Vec<Vec<u8>> = vec![];
-        let checksums_eip: Vec<String> = vec![];
+        // Convert checksums for EIP-712 (bytes[] -> hex strings for JSON)
+        let checksums_eip: Vec<String> = checksums.iter()
+            .map(|c| format!("0x{}", hex::encode(c)))
+            .collect();
 
         // IMPORTANT: Both Proto and EIP-712 must use the SAME address format!
         // Go SDK uses AccAddress.String() which returns EIP-55 checksummed address
@@ -154,7 +210,7 @@ impl GreenfieldClient {
             visibility,
             content_type: content_type.clone(),
             primary_sp_approval: Some(proto_approval),
-            expect_checksums: checksums_proto,
+            expect_checksums: checksums.clone(),  // Vec<Vec<u8>>
             redundancy_type: 0, // REDUNDANCY_EC_TYPE is 0
         };
 
@@ -164,7 +220,7 @@ impl GreenfieldClient {
             content_type,
             // IMPORTANT: Use EIP-55 checksummed address for EIP-712 signing (Go SDK's AccAddress.String())
             creator: self.get_checksummed_address(),
-            expect_checksums: checksums_eip,
+            expect_checksums: checksums_eip,  // Vec<String> with 0x prefix
             object_name,
             payload_size: payload_size.to_string(),
             primary_sp_approval: eip_approval,
@@ -195,18 +251,13 @@ impl GreenfieldClient {
             println!("  primary_sp_approval.sig len: {}", approval.sig.len());
         }
 
-        // Sign - Using Go SDK's fee params for testing: 6000000000000 BNB, 1200 gas
-        let tx_raw = create_signed_tx(
-            &self.wallet,
+        // Sign - Use the same signing logic as sign_create_bucket_tx
+        let tx_raw = self.sign_create_object_tx(
             eip_msg,
             proto_msg,
-            &self.chain_id,
-            6000000000000,    // Fee same as Go SDK
-            1200,             // Gas same as Go SDK
             acc_info.account_number,
             acc_info.sequence,
-        )
-        .await?;
+        ).await?;
 
         let mut tx_bytes = Vec::new();
         tx_raw.encode(&mut tx_bytes)?;
@@ -473,6 +524,164 @@ impl GreenfieldClient {
         let mut auth_info_bytes = Vec::new();
         auth_info.encode(&mut auth_info_bytes)?;
         
+        println!("DEBUG [CreateBucket]: TxBody length: {} bytes", body_bytes.len());
+        println!("DEBUG [CreateBucket]: TxBody bytes (full): 0x{}", hex::encode(&body_bytes));
+        println!("DEBUG [CreateBucket]: AuthInfo bytes: 0x{}", hex::encode(&auth_info_bytes));
+        
+        Ok(TxRaw {
+            body_bytes,
+            auth_info_bytes,
+            signatures: vec![sig_bytes],
+        })
+    }
+
+    /// Sign CreateObject transaction - same structure as sign_create_bucket_tx
+    async fn sign_create_object_tx(
+        &self,
+        eip_msg: Eip712MsgValue,
+        proto_msg: ProtoMsgCreateObject,
+        account_number: u64,
+        sequence: u64,
+    ) -> Result<crate::proto::cosmos::tx::v1beta1::TxRaw, Box<dyn std::error::Error>> {
+        use crate::eip712::{Fee as Eip712Fee, Tx as Eip712Tx};
+        use crate::proto::cosmos::base::v1beta1::Coin;
+        use crate::proto::cosmos::tx::v1beta1::{AuthInfo, Fee as ProtoFee, ModeInfo, SignerInfo, TxBody, TxRaw};
+        use crate::proto::ethermint::crypto::v1::ethsecp256k1::PubKey as EthPubKey;
+        use prost::Message;
+        use prost_types::Any;
+        
+        // Parse chain_id to get numeric part (e.g., "greenfield_5600-1" -> 5600)
+        let chain_id_num: u64 = if self.chain_id.contains('_') {
+            self.chain_id
+                .split('_')
+                .nth(1)
+                .and_then(|s| s.split('-').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5600)
+        } else {
+            self.chain_id.parse().unwrap_or(5600)
+        };
+        
+        // Fee (using same as Go SDK for CreateObject)
+        let fee_amount: u128 = 6000000000000;  // 0.006 BNB
+        let gas_limit: u64 = 1200;
+        
+        // Build EIP-712 Tx template - same structure as sign_create_bucket_tx
+        let eip_tx = Eip712Tx {
+            account_number: account_number.to_string(),
+            chain_id: chain_id_num.to_string(),
+            fee: Eip712Fee {
+                amount: vec![crate::eip712::Coin {
+                    denom: "BNB".to_string(),
+                    amount: fee_amount.to_string(),
+                }],
+                gas_limit: gas_limit.to_string(),
+                granter: "".to_string(),
+                payer: self.get_checksummed_address(),
+            },
+            memo: "".to_string(),
+            msg1: eip_msg,
+            sequence: sequence.to_string(),
+            timeout_height: "0".to_string(),
+        };
+        
+        // Print EIP-712 JSON for debugging
+        println!("\n📋 EIP-712 JSON Payload (sign_create_object_tx):");
+        println!("{}", serde_json::to_string_pretty(&eip_tx)?);
+        
+        // Calculate EIP-712 hash
+        println!("\n🔐 Calculating EIP-712 Hash (sign_create_object_tx)...");
+        let eip712_hash = eip_tx.get_eip712_hash(&chain_id_num.to_string())?;
+        println!("\n🔍 Final EIP-712 Hash: 0x{}", hex::encode(eip712_hash.as_bytes()));
+        
+        // Sign
+        let signature = self.wallet.sign_hash(eip712_hash)?;
+        let sig_bytes = signature.to_vec(); // 65 bytes: R || S || V
+        
+        println!("\n📝 Signature: 0x{}", hex::encode(&sig_bytes));
+        
+        // Verify signature locally
+        use ethers::core::types::Signature as EthSignature;
+        let r = ethers::core::types::U256::from_big_endian(&sig_bytes[0..32]);
+        let s = ethers::core::types::U256::from_big_endian(&sig_bytes[32..64]);
+        let v = sig_bytes[64] as u64;
+        let eth_sig = EthSignature { r, s, v };
+        match eth_sig.recover(eip712_hash) {
+            Ok(recovered_addr) => {
+                println!("DEBUG: Recovered Address: {:?}", recovered_addr);
+                if recovered_addr == self.wallet.address() {
+                    println!("DEBUG: ✅ Signature verification PASSED locally!");
+                } else {
+                    println!("DEBUG: ❌ Signature verification FAILED locally!");
+                }
+            }
+            Err(e) => {
+                println!("DEBUG: ❌ Failed to recover address: {:?}", e);
+            }
+        }
+        
+        // Build Proto TxBody
+        let mut msg_bytes = Vec::new();
+        proto_msg.encode(&mut msg_bytes)?;
+        
+        let tx_body = TxBody {
+            messages: vec![Any {
+                type_url: "/greenfield.storage.MsgCreateObject".to_string(),
+                value: msg_bytes,
+            }],
+            memo: "".to_string(),
+            timeout_height: 0,
+            extension_options: vec![],
+            non_critical_extension_options: vec![],
+            timeout_timestamp: None,
+            unordered: false,
+        };
+        
+        // Build AuthInfo
+        let pubkey_bytes = self.wallet.signer().verifying_key().to_encoded_point(true);
+        let eth_pubkey = EthPubKey {
+            key: pubkey_bytes.as_bytes().to_vec(),
+        };
+        let mut pk_bytes = Vec::new();
+        eth_pubkey.encode(&mut pk_bytes)?;
+        
+        let auth_info = AuthInfo {
+            signer_infos: vec![SignerInfo {
+                public_key: Some(Any {
+                    type_url: "/cosmos.crypto.eth.ethsecp256k1.PubKey".to_string(),
+                    value: pk_bytes,
+                }),
+                mode_info: Some(ModeInfo {
+                    sum: Some(crate::proto::cosmos::tx::v1beta1::mode_info::Sum::Single(
+                        crate::proto::cosmos::tx::v1beta1::mode_info::Single {
+                            mode: 712, // EIP-712 sign mode
+                        },
+                    )),
+                }),
+                sequence,
+            }],
+            fee: Some(ProtoFee {
+                amount: vec![Coin {
+                    denom: "BNB".to_string(),
+                    amount: fee_amount.to_string(),
+                }],
+                gas_limit,
+                payer: "".to_string(),
+                granter: "".to_string(),
+            }),
+            tip: None,
+        };
+        
+        // Encode and return TxRaw
+        let mut body_bytes = Vec::new();
+        tx_body.encode(&mut body_bytes)?;
+        let mut auth_info_bytes = Vec::new();
+        auth_info.encode(&mut auth_info_bytes)?;
+        
+        println!("DEBUG: TxBody length: {} bytes", body_bytes.len());
+        println!("DEBUG: TxBody bytes (full): 0x{}", hex::encode(&body_bytes));
+        println!("DEBUG: AuthInfo bytes: 0x{}", hex::encode(&auth_info_bytes));
+        
         Ok(TxRaw {
             body_bytes,
             auth_info_bytes,
@@ -671,6 +880,7 @@ impl GreenfieldClient {
     }
 
     /// Combined operation: Create object on-chain and upload to SP
+    /// This computes integrity hashes, creates object metadata on-chain, and uploads to SP
     pub async fn upload(
         &self,
         sp_url: &str,
@@ -679,17 +889,15 @@ impl GreenfieldClient {
         file_path: String,
         visibility: i32,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        // 1. Create Object Metadata on-chain
-        println!("📝 Creating object metadata on-chain...");
-        let file_metadata = std::fs::metadata(&file_path)?;
-        let size = file_metadata.len();
+        // 1. Create Object Metadata on-chain with checksums
+        println!("📝 Creating object metadata on-chain (computing checksums)...");
         let content_type = "application/octet-stream".to_string();
 
         let create_res = self
-            .create_object(
+            .create_object_with_file(
                 bucket.clone(),
                 object.clone(),
-                size,
+                &file_path,
                 content_type,
                 visibility,
             )

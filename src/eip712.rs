@@ -271,21 +271,29 @@ impl TypeCreateObject {
         );
 
         // 4. expect_checksums
-        // For bytes[] type (EIP-712), each bytes element is hashed directly (not as string)
-        // Empty array: keccak256 of empty bytes
+        // CRITICAL: Go SDK uses jsonpb to serialize bytes as base64 strings,
+        // then cleanTypesAndMsgValue converts base64 string to []byte(string) (ASCII bytes, NOT decoding base64).
+        // So we must hash the base64 string's ASCII bytes, not the original checksum bytes!
         let checksums_hash = if self.expect_checksums.is_empty() {
             keccak256(b"")
         } else {
+            use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
             let mut inner = Vec::new();
             for cs in &self.expect_checksums {
-                // For bytes type, we hash the raw bytes directly
-                // The expect_checksums are stored as hex strings, decode them first
-                let bytes = if cs.starts_with("0x") || cs.starts_with("0X") {
+                // First decode hex to get original bytes
+                let original_bytes = if cs.starts_with("0x") || cs.starts_with("0X") {
                     hex::decode(&cs[2..]).unwrap_or_else(|_| cs.as_bytes().to_vec())
                 } else {
                     hex::decode(cs).unwrap_or_else(|_| cs.as_bytes().to_vec())
                 };
-                inner.extend_from_slice(&keccak256(&bytes));
+                // Encode to base64 string (like jsonpb does)
+                let base64_str = BASE64_STANDARD.encode(&original_bytes);
+                // Hash the base64 string's ASCII bytes (like Go SDK's cleanTypesAndMsgValue does)
+                let ascii_bytes = base64_str.as_bytes();
+                println!("      [DEBUG] Checksum hex: 0x{}", hex::encode(&original_bytes));
+                println!("      [DEBUG] Checksum base64: {}", base64_str);
+                println!("      [DEBUG] Checksum base64 ASCII hash: 0x{}", hex::encode(keccak256(ascii_bytes)));
+                inner.extend_from_slice(&keccak256(ascii_bytes));
             }
             keccak256(&inner)
         };

@@ -468,13 +468,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !file.exists() {
                 return Err("File does not exist".into());
             }
+            let file_path = file.to_string_lossy().to_string();
             let size = std::fs::metadata(&file)?.len();
             let content_type = "application/octet-stream".to_string();
 
             println!("Creating Object: {}/{} ({} bytes)...", bucket, object, size);
 
+            // Use create_object_with_file to compute checksums
             let res = client
-                .create_object(bucket, object, size, content_type, visibility)
+                .create_object_with_file(
+                    bucket.to_string(),
+                    object.to_string(),
+                    &file_path,
+                    content_type,
+                    visibility,
+                )
                 .await?;
             println!("Response: {}", res);
         }
