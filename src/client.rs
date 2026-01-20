@@ -1,5 +1,7 @@
-use crate::eip712::{MsgValue as Eip712MsgValue, PrimarySpApproval as Eip712Approval};
+use crate::bucket_eip712::{MsgCreateBucket as Eip712MsgCreateBucket, PrimarySpApproval as Eip712BucketApproval, TxCreateBucket};
+use crate::eip712::{MsgValue as Eip712MsgValue, PrimarySpApproval as Eip712Approval, Visibility};
 use crate::proto::greenfield::common::Approval as ProtoApproval;
+use crate::proto::greenfield::storage::MsgCreateBucket as ProtoMsgCreateBucket;
 use crate::proto::greenfield::storage::MsgCreateObject as ProtoMsgCreateObject;
 use crate::tx::create_signed_tx;
 
@@ -110,7 +112,13 @@ impl GreenfieldClient {
     ) -> Result<String, Box<dyn std::error::Error>> {
         let _address = self.wallet.address();
 
-        // 1. 定义枚举（必须能转为 Greenfield 期待的字符串全称）
+        // 1. Fetch bucket info to get correct global_virtual_group_family_id
+        println!("DEBUG: Fetching bucket info for '{}'...", bucket_name);
+        let bucket_info = crate::bucket::get_bucket_info(&self.rpc_url, &bucket_name).await?;
+        let gvg_family_id = bucket_info.global_virtual_group_family_id;
+        println!("DEBUG: Got global_virtual_group_family_id: {}", gvg_family_id);
+
+        // 2. 定义枚举（必须能转为 Greenfield 期待的字符串全称）
         let visibility_enum = match visibility {
             1 => crate::eip712::Visibility::Public,
             2 => crate::eip712::Visibility::Private,
@@ -118,25 +126,28 @@ impl GreenfieldClient {
             _ => crate::eip712::Visibility::Public,
         };
 
-        // Dummy Approval (Phase 3 will fetch signature from SP)
+        // Approval with correct gvg_family_id from bucket info
         let proto_approval = ProtoApproval {
             expired_height: 18446744073709551615,
-            global_virtual_group_family_id: 0,
+            global_virtual_group_family_id: gvg_family_id,
             sig: vec![],
         };
         let eip_approval = Eip712Approval {
             expired_height: "18446744073709551615".to_string(),
-            global_virtual_group_family_id: "0".to_string(), // String for EIP-712
+            global_virtual_group_family_id: gvg_family_id.to_string(),
         };
 
-        // Dummy Checksums (Phase 3 will calc real checksums)
-        let checksums_proto = vec![vec![0u8; 32]];
-        let checksums_eip = vec![];
+        // IMPORTANT: Proto and EIP-712 must use the SAME checksums!
+        // Using empty array for now (SP will calculate checksums)
+        let checksums_proto: Vec<Vec<u8>> = vec![];
+        let checksums_eip: Vec<String> = vec![];
 
-        let bech32_addr = self.get_bech32_address();
+        // IMPORTANT: Both Proto and EIP-712 must use the SAME address format!
+        // Go SDK uses AccAddress.String() which returns EIP-55 checksummed address
+        let checksummed_addr = self.get_checksummed_address();
 
         let proto_msg = ProtoMsgCreateObject {
-            creator: bech32_addr.clone(),
+            creator: checksummed_addr.clone(),
             bucket_name: bucket_name.clone(),
             object_name: object_name.clone(),
             payload_size,
@@ -151,6 +162,7 @@ impl GreenfieldClient {
             type_url: "/greenfield.storage.MsgCreateObject".to_string(),
             bucket_name: bucket_name.to_string(),
             content_type,
+            // IMPORTANT: Use EIP-55 checksummed address for EIP-712 signing (Go SDK's AccAddress.String())
             creator: self.get_checksummed_address(),
             expect_checksums: checksums_eip,
             object_name,
@@ -167,14 +179,30 @@ impl GreenfieldClient {
             acc_info.account_number, acc_info.sequence
         );
 
-        // Sign
+        // DEBUG: Print Proto message details for comparison with Go SDK
+        println!("DEBUG: Proto MsgCreateObject:");
+        println!("  creator: {}", proto_msg.creator);
+        println!("  bucket_name: {}", proto_msg.bucket_name);
+        println!("  object_name: {}", proto_msg.object_name);
+        println!("  payload_size: {}", proto_msg.payload_size);
+        println!("  visibility: {}", proto_msg.visibility);
+        println!("  content_type: {}", proto_msg.content_type);
+        println!("  expect_checksums len: {}", proto_msg.expect_checksums.len());
+        println!("  redundancy_type: {}", proto_msg.redundancy_type);
+        if let Some(ref approval) = proto_msg.primary_sp_approval {
+            println!("  primary_sp_approval.expired_height: {}", approval.expired_height);
+            println!("  primary_sp_approval.gvg_family_id: {}", approval.global_virtual_group_family_id);
+            println!("  primary_sp_approval.sig len: {}", approval.sig.len());
+        }
+
+        // Sign - Using Go SDK's fee params for testing: 6000000000000 BNB, 1200 gas
         let tx_raw = create_signed_tx(
             &self.wallet,
             eip_msg,
             proto_msg,
             &self.chain_id,
-            5000000000000000, // Fee 0.005 BNB
-            200000,           // Gas
+            6000000000000,    // Fee same as Go SDK
+            1200,             // Gas same as Go SDK
             acc_info.account_number,
             acc_info.sequence,
         )
@@ -210,6 +238,246 @@ impl GreenfieldClient {
         }
 
         Ok(text)
+    }
+
+    /// Create a new bucket on Greenfield
+    pub async fn create_bucket(
+        &self,
+        bucket_name: String,
+        primary_sp_address: String,
+        visibility: i32,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let checksummed_addr = self.get_checksummed_address();
+        
+        println!("🪣 Creating bucket '{}'...", bucket_name);
+        println!("   Creator: {}", checksummed_addr);
+        println!("   Primary SP: {}", primary_sp_address);
+        println!("   Visibility: {}", visibility);
+        
+        // Step 1: Get SP info to find the SP ID
+        println!("   Fetching SP info...");
+        let sps = crate::sp::list_storage_providers(&self.rpc_url).await?;
+        let sp = sps.iter()
+            .find(|s| s.operator_address.to_lowercase() == primary_sp_address.to_lowercase())
+            .ok_or_else(|| format!("SP not found: {}", primary_sp_address))?;
+        
+        println!("   SP ID: {}, Endpoint: {}", sp.id, sp.endpoint);
+        
+        // Step 2: Get VGF ID for this SP from chain
+        let vgf_id = crate::sp::get_vgf_id_for_sp(&self.rpc_url, sp.id).await?;
+        
+        // Get account info
+        let acc_info = self.get_account_info().await?;
+        println!("   Account Number: {}, Sequence: {}", acc_info.account_number, acc_info.sequence);
+        
+        // Create Proto message with correct VGF ID
+        let proto_msg = ProtoMsgCreateBucket {
+            creator: checksummed_addr.clone(),
+            bucket_name: bucket_name.clone(),
+            visibility,
+            payment_address: "".to_string(),  // Use creator as default
+            primary_sp_address: primary_sp_address.clone(),
+            primary_sp_approval: Some(ProtoApproval {
+                expired_height: 0,  // 0 means no expiration
+                global_virtual_group_family_id: vgf_id,  // Use the VGF ID from SP
+                sig: vec![],
+            }),
+            charged_read_quota: 0,
+        };
+        
+        // Create EIP-712 message
+        let visibility_enum = match visibility {
+            1 => Visibility::Public,
+            2 => Visibility::Private,
+            3 => Visibility::Inherit,
+            _ => Visibility::Public,
+        };
+        
+        let eip_msg = Eip712MsgCreateBucket {
+            type_url: "/greenfield.storage.MsgCreateBucket".to_string(),
+            bucket_name: bucket_name.clone(),
+            charged_read_quota: "0".to_string(),
+            creator: checksummed_addr.clone(),
+            payment_address: "".to_string(),
+            primary_sp_address: primary_sp_address.clone(),
+            primary_sp_approval: Eip712BucketApproval {
+                expired_height: "0".to_string(),
+                global_virtual_group_family_id: vgf_id,  // Use the VGF ID from SP
+            },
+            visibility: visibility_enum,
+        };
+        
+        // Sign the transaction
+        let tx_raw = self.sign_create_bucket_tx(
+            eip_msg,
+            proto_msg,
+            acc_info.account_number,
+            acc_info.sequence,
+        ).await?;
+        
+        // Broadcast
+        let mut tx_bytes = Vec::new();
+        tx_raw.encode(&mut tx_bytes)?;
+        let tx_bytes_base64 = base64::engine::general_purpose::STANDARD.encode(tx_bytes);
+        
+        let url = format!("{}/cosmos/tx/v1beta1/txs", self.rpc_url);
+        let req_body = BroadcastReq {
+            tx_bytes: tx_bytes_base64,
+            mode: "BROADCAST_MODE_SYNC".to_string(),
+        };
+        
+        println!("📡 Broadcasting transaction...");
+        let resp = self.http_client.post(&url).json(&req_body).send().await?;
+        
+        let status = resp.status();
+        let text = resp.text().await?;
+        
+        if !status.is_success() {
+            return Err(format!("Broadcast failed with status {}: {}", status, text).into());
+        }
+        
+        let resp_data: BroadcastResponse = serde_json::from_str(&text)?;
+        if resp_data.tx_response.code != 0 {
+            return Err(format!(
+                "Tx Failed (Code {}): {}",
+                resp_data.tx_response.code, resp_data.tx_response.raw_log
+            ).into());
+        }
+        
+        println!("✅ Bucket created successfully!");
+        println!("   TxHash: {}", resp_data.tx_response.txhash);
+        
+        Ok(resp_data.tx_response.txhash)
+    }
+    
+    /// Internal method to sign CreateBucket transaction
+    async fn sign_create_bucket_tx(
+        &self,
+        eip_msg: Eip712MsgCreateBucket,
+        proto_msg: ProtoMsgCreateBucket,
+        account_number: u64,
+        sequence: u64,
+    ) -> Result<crate::proto::cosmos::tx::v1beta1::TxRaw, Box<dyn std::error::Error>> {
+        use crate::eip712::Fee;
+        use crate::proto::cosmos::base::v1beta1::Coin;
+        use crate::proto::cosmos::tx::v1beta1::{AuthInfo, Fee as ProtoFee, ModeInfo, SignerInfo, TxBody, TxRaw};
+        use crate::proto::ethermint::crypto::v1::ethsecp256k1::PubKey as EthPubKey;
+        use prost::Message;
+        use prost_types::Any;
+        
+        // Parse chain_id to get numeric part (e.g., "greenfield_5600-1" -> 5600)
+        let chain_id_num: u64 = if self.chain_id.contains('_') {
+            self.chain_id
+                .split('_')
+                .nth(1)
+                .and_then(|s| s.split('-').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5600)
+        } else {
+            self.chain_id.parse().unwrap_or(5600)
+        };
+        
+        // Fee (using same as Go SDK)
+        let fee_amount: u128 = 12000000000000;  // 0.012 BNB
+        let gas_limit: u64 = 2400;
+        
+        // Build EIP-712 Tx template
+        let eip_tx = TxCreateBucket {
+            account_number: account_number.to_string(),
+            chain_id: chain_id_num.to_string(),
+            fee: Fee {
+                amount: vec![crate::eip712::Coin {
+                    denom: "BNB".to_string(),
+                    amount: fee_amount.to_string(),
+                }],
+                gas_limit: gas_limit.to_string(),
+                granter: "".to_string(),
+                payer: self.get_checksummed_address(),
+            },
+            memo: "".to_string(),
+            msg1: eip_msg,
+            sequence: sequence.to_string(),
+            timeout_height: "0".to_string(),
+        };
+        
+        // Print EIP-712 JSON for debugging
+        println!("\n📋 EIP-712 JSON Payload:");
+        println!("{}", serde_json::to_string_pretty(&eip_tx)?);
+        
+        // Calculate EIP-712 hash
+        println!("\n🔐 Calculating EIP-712 Hash...");
+        let eip712_hash = eip_tx.get_eip712_hash(&chain_id_num.to_string())?;
+        println!("\n🔍 Final EIP-712 Hash: 0x{}", hex::encode(eip712_hash.as_bytes()));
+        
+        // Sign
+        let signature = self.wallet.sign_hash(eip712_hash)?;
+        let sig_bytes = signature.to_vec(); // 65 bytes: R || S || V
+        
+        println!("\n📝 Signature: 0x{}", hex::encode(&sig_bytes));
+        
+        // Build Proto TxBody
+        let mut msg_bytes = Vec::new();
+        proto_msg.encode(&mut msg_bytes)?;
+        
+        let tx_body = TxBody {
+            messages: vec![Any {
+                type_url: "/greenfield.storage.MsgCreateBucket".to_string(),
+                value: msg_bytes,
+            }],
+            memo: "".to_string(),
+            timeout_height: 0,
+            extension_options: vec![],
+            non_critical_extension_options: vec![],
+            timeout_timestamp: None,
+            unordered: false,
+        };
+        
+        // Build AuthInfo
+        let pubkey_bytes = self.wallet.signer().verifying_key().to_encoded_point(true);
+        let eth_pubkey = EthPubKey {
+            key: pubkey_bytes.as_bytes().to_vec(),
+        };
+        let mut pk_bytes = Vec::new();
+        eth_pubkey.encode(&mut pk_bytes)?;
+        
+        let auth_info = AuthInfo {
+            signer_infos: vec![SignerInfo {
+                public_key: Some(Any {
+                    type_url: "/cosmos.crypto.eth.ethsecp256k1.PubKey".to_string(),
+                    value: pk_bytes,
+                }),
+                mode_info: Some(ModeInfo {
+                    sum: Some(crate::proto::cosmos::tx::v1beta1::mode_info::Sum::Single(
+                        crate::proto::cosmos::tx::v1beta1::mode_info::Single {
+                            mode: 712, // EIP-712 sign mode
+                        },
+                    )),
+                }),
+                sequence,
+            }],
+            fee: Some(ProtoFee {
+                amount: vec![Coin {
+                    denom: "BNB".to_string(),
+                    amount: fee_amount.to_string(),
+                }],
+                gas_limit,
+                payer: "".to_string(),
+                granter: "".to_string(),
+            }),
+            tip: None,
+        };
+        
+        // Encode and return TxRaw
+        let mut body_bytes = Vec::new();
+        tx_body.encode(&mut body_bytes)?;
+        let mut auth_info_bytes = Vec::new();
+        auth_info.encode(&mut auth_info_bytes)?;
+        
+        Ok(TxRaw {
+            body_bytes,
+            auth_info_bytes,
+            signatures: vec![sig_bytes],
+        })
     }
 
     pub async fn put_object(
@@ -442,6 +710,13 @@ impl GreenfieldClient {
         bech32::encode("gnfd", bytes.to_base32(), Variant::Bech32).unwrap_or_else(|_| String::new())
     }
 
+    /// Get the lowercase hex address with 0x prefix (e.g., 0xd486d5ed56bf...)
+    /// This is the format expected by Greenfield proto messages
+    pub fn get_hex_address(&self) -> String {
+        let addr = self.wallet.address();
+        format!("0x{}", hex::encode(addr.as_bytes()))
+    }
+
     /// Get the checksummed Ethereum-style hex address (e.g., 0xD486D5ed56bF...)
     /// This is the format used by the official Greenfield SDK for EIP-712 signing
     pub fn get_checksummed_address(&self) -> String {
@@ -476,5 +751,139 @@ impl GreenfieldClient {
             }
         }
         checksummed
+    }
+
+    /// Debug EIP-712 calculation without sending transaction
+    /// This helps compare with Go SDK output
+    pub async fn debug_eip712(
+        &self,
+        bucket_name: String,
+        object_name: String,
+        payload_size: u64,
+        visibility: i32,
+        global_virtual_group_family_id: u32,
+        sequence: u64,
+        account_number: u64,
+        fee_amount: u64,
+        gas_limit: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::eip712::{Tx, Fee, Coin, TypeCreateObject, PrimarySpApproval, Visibility, RedundancyType};
+        use crate::utils::extract_eip155_chain_id;
+        
+        let chain_id_num = extract_eip155_chain_id(&self.chain_id)?;
+        let checksummed_addr = self.get_checksummed_address();
+        
+        println!("\n📄 EIP-712 Input Data:");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("  Creator: {}", checksummed_addr);
+        println!("  Chain ID: {} (numeric: {})", self.chain_id, chain_id_num);
+        println!("  Account Number: {}", account_number);
+        println!("  Sequence: {}", sequence);
+        println!("  Bucket: {}", bucket_name);
+        println!("  Object: {}", object_name);
+        println!("  Payload Size: {}", payload_size);
+        println!("  Visibility: {} ({})", visibility, if visibility == 2 { "PRIVATE" } else { "INHERIT" });
+        println!("  GVG Family ID: {}", global_virtual_group_family_id);
+        println!("  Fee: {} BNB (wei)", fee_amount);
+        println!("  Gas Limit: {}", gas_limit);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        
+        // Build EIP-712 message (matching Go SDK structure)
+        let visibility_enum = match visibility {
+            1 => Visibility::Public,
+            2 => Visibility::Private,
+            _ => Visibility::Inherit,
+        };
+        
+        let eip_msg = TypeCreateObject {
+            type_url: "/greenfield.storage.MsgCreateObject".to_string(),
+            bucket_name: bucket_name.clone(),
+            content_type: "application/octet-stream".to_string(),
+            creator: checksummed_addr.clone(),
+            expect_checksums: vec![], // Empty for now - Go SDK calculates these
+            object_name: object_name.clone(),
+            payload_size: payload_size.to_string(),
+            primary_sp_approval: PrimarySpApproval {
+                expired_height: u64::MAX.to_string(),
+                global_virtual_group_family_id: global_virtual_group_family_id.to_string(),
+            },
+            redundancy_type: RedundancyType::EcType,
+            visibility: visibility_enum,
+        };
+        
+        let fee = Fee {
+            amount: vec![Coin {
+                denom: "BNB".to_string(),
+                amount: fee_amount.to_string(),
+            }],
+            gas_limit: gas_limit.to_string(),
+            granter: String::new(),
+            payer: checksummed_addr.clone(),
+        };
+        
+        let tx = Tx {
+            account_number: account_number.to_string(),
+            chain_id: chain_id_num.to_string(),
+            fee,
+            memo: String::new(),
+            msg1: eip_msg,
+            sequence: sequence.to_string(),
+            timeout_height: "0".to_string(),
+        };
+        
+        // Print JSON representation
+        println!("\n📋 EIP-712 JSON Payload:");
+        let json = serde_json::to_string_pretty(&tx)?;
+        println!("{}", json);
+        
+        // Calculate EIP-712 hash
+        println!("\n🔍 EIP-712 Hash Calculation:");
+        let struct_hash = tx.get_struct_hash()?;
+        let domain_separator = Tx::get_domain_separator(&chain_id_num.to_string())?;
+        
+        println!("\n   Domain Separator: 0x{}", hex::encode(domain_separator));
+        println!("   Struct Hash: 0x{}", hex::encode(struct_hash));
+        
+        // Final EIP-712 hash
+        use tiny_keccak::{Hasher, Keccak};
+        let mut final_data = Vec::new();
+        final_data.push(0x19);
+        final_data.push(0x01);
+        final_data.extend_from_slice(domain_separator.as_bytes());
+        final_data.extend_from_slice(struct_hash.as_bytes());
+        
+        let mut hasher = Keccak::v256();
+        hasher.update(&final_data);
+        let mut final_hash = [0u8; 32];
+        hasher.finalize(&mut final_hash);
+        
+        println!("   Final EIP-712 Hash: 0x{}", hex::encode(final_hash));
+        
+        // Sign and verify
+        println!("\n🔐 Signature (for verification):");
+        let sig = self.wallet.sign_hash(ethers::types::H256::from(final_hash))?;
+        
+        // Convert U256 to bytes for printing
+        let mut r_bytes = [0u8; 32];
+        let mut s_bytes = [0u8; 32];
+        sig.r.to_big_endian(&mut r_bytes);
+        sig.s.to_big_endian(&mut s_bytes);
+        
+        println!("   R: 0x{}", hex::encode(r_bytes));
+        println!("   S: 0x{}", hex::encode(s_bytes));
+        println!("   V: {}", sig.v);
+        
+        // Recover and verify
+        let recovered = sig.recover(ethers::types::H256::from(final_hash))?;
+        println!("   Recovered Address: {:?}", recovered);
+        println!("   Expected Address: {:?}", self.wallet.address());
+        
+        if recovered == self.wallet.address() {
+            println!("   ✅ Signature verification PASSED locally!");
+        } else {
+            println!("   ❌ Signature verification FAILED locally!");
+        }
+        
+        Ok(())
     }
 }

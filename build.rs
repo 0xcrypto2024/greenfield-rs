@@ -16,7 +16,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "deps/cosmos-sdk/proto/cosmos/base/abci/v1beta1/abci.proto",
         "deps/cosmos-sdk/proto/cosmos/crypto/multisig/v1beta1/multisig.proto",
         "deps/cosmos-sdk/proto/cosmos/crypto/secp256k1/keys.proto",
-        "deps/cosmos-sdk/proto/cosmos/crypto/ethsecp256k1/keys.proto", // Greenfield Ethereum-compatible keys
         "deps/cosmos-sdk/proto/cosmos/tx/signing/v1beta1/signing.proto",
         "deps/cosmos-sdk/proto/tendermint/types/types.proto",
         "deps/ethermint/proto/ethermint/types/v1/web3.proto",

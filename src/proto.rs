@@ -59,9 +59,6 @@ pub mod cosmos {
         pub mod secp256k1 {
             tonic::include_proto!("cosmos.crypto.secp256k1");
         }
-        pub mod ethsecp256k1 {
-            tonic::include_proto!("cosmos.crypto.ethsecp256k1");
-        }
     }
 }
 

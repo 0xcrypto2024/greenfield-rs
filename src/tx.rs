@@ -4,7 +4,7 @@ use crate::proto::cosmos::tx::v1beta1::{AuthInfo, Fee, ModeInfo, SignerInfo, TxB
 use crate::proto::greenfield::storage::MsgCreateObject as ProtoMsgCreateObject;
 
 use ethers::core::k256::ecdsa::SigningKey;
-use ethers::signers::Wallet;
+use ethers::signers::{Signer, Wallet};
 use prost::Message;
 use prost_types::Any;
 
@@ -31,6 +31,10 @@ pub async fn create_signed_tx(
 
     // Calculate EIP-712 hash first because we need the signature for ExtensionOptions
     // Convert proto message to EIP-712 message format (camelCase)
+    // CRITICAL: Fee.payer must be the signer's address in EIP-55 checksummed format
+    // Go SDK's AccAddress.String() returns checksummed address with 0x prefix
+    // Note: wallet.address().to_string() may truncate, use explicit format
+    let fee_payer = ethers::utils::to_checksum(&wallet.address(), None);
     let eip_tx_template = crate::eip712::Tx {
         account_number: account_number.to_string(),
         chain_id: chain_id_num.to_string(),
@@ -41,7 +45,7 @@ pub async fn create_signed_tx(
             }],
             gas_limit: gas_limit.to_string(),
             granter: "".to_string(),
-            payer: "".to_string(),
+            payer: fee_payer,  // Use signer's address as fee payer
         },
         memo: "".to_string(),
         // Changed msgs array to msg1 single object (Official Spec)
@@ -55,9 +59,51 @@ pub async fn create_signed_tx(
         "📄 DEBUG: EIP-712 JSON Payload:\n{}",
         serde_json::to_string_pretty(&eip_tx_template)?
     );
+    
+    // Calculate struct hash once (same for both verifyingContract variants)
+    let struct_hash = eip_tx_template.get_struct_hash()?;
+    
+    // Calculate both domain separators for comparison
+    let domain_greenfield = crate::eip712::Tx::get_domain_separator_with_vc(chain_id, "greenfield")?;
+    let domain_altai = crate::eip712::Tx::get_domain_separator_with_vc(chain_id, "0x71e835aff094655dEF897fbc85534186DbeaB75d")?;
+    
+    // Calculate final hashes for both variants
+    let hash_greenfield = {
+        let mut digest_input = Vec::new();
+        digest_input.push(0x19);
+        digest_input.push(0x01);
+        digest_input.extend_from_slice(domain_greenfield.as_bytes());
+        digest_input.extend_from_slice(struct_hash.as_bytes());
+        ethers::core::types::H256::from(ethers::utils::keccak256(&digest_input))
+    };
+    
+    let hash_altai = {
+        let mut digest_input = Vec::new();
+        digest_input.push(0x19);
+        digest_input.push(0x01);
+        digest_input.extend_from_slice(domain_altai.as_bytes());
+        digest_input.extend_from_slice(struct_hash.as_bytes());
+        ethers::core::types::H256::from(ethers::utils::keccak256(&digest_input))
+    };
+    
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("📊 EIP-712 Hash Comparison (both verifyingContract variants):");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("   Struct Hash: 0x{}", hex::encode(struct_hash.as_bytes()));
+    println!();
+    println!("   [isAltai=false] verifyingContract = 'greenfield'");
+    println!("     Domain Separator: 0x{}", hex::encode(domain_greenfield.as_bytes()));
+    println!("     Final Hash:       0x{}", hex::encode(hash_greenfield.as_bytes()));
+    println!();
+    println!("   [isAltai=true]  verifyingContract = '0x71e835...'");
+    println!("     Domain Separator: 0x{}", hex::encode(domain_altai.as_bytes()));
+    println!("     Final Hash:       0x{}", hex::encode(hash_altai.as_bytes()));
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    
+    // Use "greenfield" for verifyingContract - matches Go SDK client behavior
     let eip712_hash = eip_tx_template.get_eip712_hash(chain_id)?;
     println!(
-        "🔍 DEBUG: Final EIP-712 hash: 0x{}",
+        "🔐 Using EIP-712 hash: 0x{}",
         hex::encode(eip712_hash.as_bytes())
     );
 
@@ -66,10 +112,40 @@ pub async fn create_signed_tx(
     // DO NOT normalize V to 0/1. Greenfield expects Ethereum-style 27/28
     // for public key recovery in its EIP-712 handler.
 
+    // Debug: Print wallet public key info
+    let pub_key_compressed = wallet.signer().verifying_key().to_sec1_bytes().to_vec();
+    println!("DEBUG: Wallet Address: {:?}", wallet.address());
+    println!("DEBUG: Wallet PubKey (compressed, 33 bytes): 0x{}", hex::encode(&pub_key_compressed));
+    println!("DEBUG: Signature R: 0x{}", hex::encode(&signature.to_vec()[0..32]));
+    println!("DEBUG: Signature S: 0x{}", hex::encode(&signature.to_vec()[32..64]));
+    println!("DEBUG: Signature V: {} (0x{:02x})", signature.to_vec()[64], signature.to_vec()[64]);
     println!(
-        "DEBUG: Raw Signature (65 bytes) [Normalized V]: 0x{}",
+        "DEBUG: Raw Signature (65 bytes): 0x{}",
         hex::encode(signature.to_vec())
     );
+    
+    // Debug: Try to recover public key from signature
+    use ethers::core::types::Signature as EthSignature;
+    let sig_bytes = signature.to_vec();
+    let r = ethers::core::types::U256::from_big_endian(&sig_bytes[0..32]);
+    let s = ethers::core::types::U256::from_big_endian(&sig_bytes[32..64]);
+    let v = sig_bytes[64] as u64;
+    let eth_sig = EthSignature { r, s, v };
+    match eth_sig.recover(eip712_hash) {
+        Ok(recovered_addr) => {
+            println!("DEBUG: Recovered Address from signature: {:?}", recovered_addr);
+            if recovered_addr == wallet.address() {
+                println!("DEBUG: ✅ Signature verification PASSED locally!");
+            } else {
+                println!("DEBUG: ❌ Signature verification FAILED locally! Addresses don't match.");
+                println!("DEBUG:   Expected: {:?}", wallet.address());
+                println!("DEBUG:   Got:      {:?}", recovered_addr);
+            }
+        }
+        Err(e) => {
+            println!("DEBUG: ❌ Failed to recover address: {:?}", e);
+        }
+    }
 
     // Enable mode 712 (EIP-712)
     let body = TxBody {
@@ -89,9 +165,9 @@ pub async fn create_signed_tx(
     body.encode(&mut body_bytes)?;
 
     // 2. AuthInfo
-    // PubKey - Use cosmos.crypto.eth.ethsecp256k1 (✓ Confirmed working type_url)
+    // PubKey - Use ethermint.crypto.v1.ethsecp256k1 (Ethereum-compatible keys)
     let pub_key_bytes = wallet.signer().verifying_key().to_sec1_bytes().to_vec(); // 33 bytes compressed
-    let eth_pub = crate::proto::cosmos::crypto::ethsecp256k1::PubKey { key: pub_key_bytes };
+    let eth_pub = crate::proto::ethermint::crypto::v1::ethsecp256k1::PubKey { key: pub_key_bytes };
     let mut pub_key_any_bytes = Vec::new();
     eth_pub.encode(&mut pub_key_any_bytes)?;
 
@@ -131,6 +207,11 @@ pub async fn create_signed_tx(
 
     let mut auth_info_bytes = Vec::new();
     auth_info.encode(&mut auth_info_bytes)?;
+
+    // DEBUG: Print encoded bytes for analysis
+    println!("DEBUG: TxBody bytes (first 200): 0x{}", hex::encode(&body_bytes[..std::cmp::min(200, body_bytes.len())]));
+    println!("DEBUG: TxBody total length: {} bytes", body_bytes.len());
+    println!("DEBUG: AuthInfo bytes: 0x{}", hex::encode(&auth_info_bytes));
 
     // NOTE: We put the signature in TxRaw.signatures as expected by standard EIP-712 handler
     Ok(TxRaw {
