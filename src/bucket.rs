@@ -95,59 +95,52 @@ pub async fn get_bucket_info(rpc_url: &str, bucket_name: &str) -> Result<BucketI
     })
 }
 
-/// Get SP info for a bucket (primary SP)
+/// Get SP endpoint for a bucket (from primary SP)
 pub async fn get_bucket_primary_sp(rpc_url: &str, bucket_name: &str) -> Result<String, Box<dyn std::error::Error>> {
     let bucket_info = get_bucket_info(rpc_url, bucket_name).await?;
+    let vgf_id = bucket_info.global_virtual_group_family_id;
     
-    // Get the global virtual group family
-    let url = format!(
-        "{}/greenfield/virtualgroup/global_virtual_group_family/{}",
-        rpc_url, bucket_info.global_virtual_group_family_id
-    );
+    println!("   Bucket VGF ID: {}", vgf_id);
     
     let client = Client::new();
+    
+    // Step 1: Get all VGF families and find the one matching our bucket's VGF ID
+    let url = format!("{}/greenfield/virtualgroup/global_virtual_group_families?pagination.limit=100", rpc_url);
     let resp = client.get(&url).send().await?;
     
     if !resp.status().is_success() {
-        return Err(format!("Failed to get virtual group family: {}", resp.status()).into());
+        return Err(format!("Failed to get VGF families: {}", resp.status()).into());
     }
     
     #[derive(Deserialize)]
-    struct VgfResponse {
-        global_virtual_group_family: Option<VgfJson>,
+    struct VgfFamiliesResponse {
+        gvg_families: Vec<VgfJson>,
     }
     
     #[derive(Deserialize)]
     struct VgfJson {
-        primary_sp_id: Option<u32>,
+        id: u32,
+        primary_sp_id: u32,
     }
     
-    let data: VgfResponse = resp.json().await?;
-    let vgf = data.global_virtual_group_family.ok_or("No VGF in response")?;
-    let sp_id = vgf.primary_sp_id.ok_or("No primary_sp_id")?;
+    let data: VgfFamiliesResponse = resp.json().await?;
     
-    // Get SP info by ID
-    let url = format!("{}/greenfield/sp/storage_provider/{}", rpc_url, sp_id);
-    let resp = client.get(&url).send().await?;
+    let vgf = data.gvg_families.iter()
+        .find(|f| f.id == vgf_id)
+        .ok_or_else(|| format!("VGF family {} not found", vgf_id))?;
     
-    if !resp.status().is_success() {
-        return Err(format!("Failed to get SP info: {}", resp.status()).into());
-    }
+    let sp_id = vgf.primary_sp_id;
+    println!("   Primary SP ID: {}", sp_id);
     
-    #[derive(Deserialize)]
-    struct SpResponse {
-        storage_provider: Option<SpJson>,
-    }
+    // Step 2: Get all SPs and find the one matching our primary SP ID
+    let sps = crate::sp::list_storage_providers(rpc_url).await?;
     
-    #[derive(Deserialize)]
-    struct SpJson {
-        operator_address: Option<String>,
-        endpoint: Option<String>,
-    }
+    let sp = sps.iter()
+        .find(|s| s.id == sp_id)
+        .ok_or_else(|| format!("SP {} not found", sp_id))?;
     
-    let data: SpResponse = resp.json().await?;
-    let sp = data.storage_provider.ok_or("No SP in response")?;
+    println!("   SP Endpoint: {}", sp.endpoint);
     
-    Ok(sp.endpoint.unwrap_or_default())
+    Ok(sp.endpoint.clone())
 }
 

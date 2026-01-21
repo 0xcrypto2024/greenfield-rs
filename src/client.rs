@@ -689,6 +689,8 @@ impl GreenfieldClient {
         })
     }
 
+    /// Upload object data to Storage Provider
+    /// This implements GNFD1-ECDSA authentication matching Go SDK exactly
     pub async fn put_object(
         &self,
         sp_url: &str,
@@ -698,83 +700,131 @@ impl GreenfieldClient {
     ) -> Result<String, Box<dyn std::error::Error>> {
         use chrono::{Duration, Utc};
         use ethers::utils::keccak256;
-        use md5::{Digest, Md5};
         use std::fs;
+        use tokio::time::sleep;
+        use std::time::Duration as StdDuration;
+
+        // 0. Wait for SP to sync object info (like Go SDK's headSPObjectInfo)
+        // Retry up to 4 times with exponential backoff (500ms, 1s, 2s, 4s)
+        println!("   Waiting for SP to sync object info...");
+        let mut backoff_ms = 500u64;
+        for retry in 0..4 {
+            match self.get_object_status_from_sp(sp_url, &bucket, &object).await {
+                Ok(_) => {
+                    println!("   ✓ SP has synced object info");
+                    break;
+                }
+                Err(e) => {
+                    let err_str = e.to_string().to_lowercase();
+                    // If it's not "no such object" error, SP knows about it, continue
+                    if !err_str.contains("no such object") && !err_str.contains("not been created") {
+                        println!("   ✓ SP responded (object exists)");
+                        break;
+                    }
+                    
+                    if retry < 3 {
+                        println!("   Retry {}/4 (waiting {}ms): {}", retry + 1, backoff_ms, e);
+                        sleep(StdDuration::from_millis(backoff_ms)).await;
+                        backoff_ms *= 2;  // Exponential backoff
+                    } else {
+                        return Err(format!("SP failed to sync object info after 4 retries: {}", e).into());
+                    }
+                }
+            }
+        }
 
         // 1. Read file
         let file_content = fs::read(&file_path)?;
         let content_type = "application/octet-stream";
+        let content_length = file_content.len();
 
-        // 2. Calculate Content-MD5 (base64-encoded MD5)
-        let mut hasher = Md5::new();
-        hasher.update(&file_content);
-        let md5_result = hasher.finalize();
-        let content_md5 = base64::engine::general_purpose::STANDARD.encode(md5_result);
-
-        // 3. Expiry Timestamp (RFC3339, 1 hour from now)
+        // 2. Expiry Timestamp (ISO 8601 format: 2021-09-30T16:25:24Z)
         let expiry = (Utc::now() + Duration::hours(1))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
 
-        // 4. URL components
+        // 3. URL components
         let url_path = format!("/{}/{}", bucket, object);
-        let raw_query = ""; // No query params for PUT
+        
+        // 4. Parse SP host from URL (remove trailing slash if present)
+        let sp_host = sp_url
+            .replace("https://", "")
+            .replace("http://", "")
+            .trim_end_matches('/')
+            .to_string();
 
-        // 5. Parse SP host from URL
-        let sp_host = sp_url.replace("https://", "").replace("http://", "");
-
-        // 6. Build Canonical Headers (sorted alphabetically, lowercase)
-        // Based on Go code: headers are "header:value\n", then host value alone at end
-        // Sorted order: content-md5, content-type, x-gnfd-expiry-timestamp (sorted)
-        // Then host value at the end (no "host:" prefix per Go code lines 50-53)
+        // 5. Build Canonical Request matching Go SDK's GetCanonicalRequest exactly:
+        // Method\nEncodedPath\nRawQuery\nCanonicalHeaders\nSignedHeaders
+        //
+        // Go SDK supportHeads (used headers are filtered from this list):
+        //   Content-Type, X-Gnfd-Txn-Hash, X-Gnfd-Object-ID, X-Gnfd-Redundancy-Index, 
+        //   X-Gnfd-Resource, X-Gnfd-Date, Range, X-Gnfd-Piece-Index, Content-MD5, 
+        //   X-Gnfd-Unsigned-Msg, X-Gnfd-User-Address, X-Gnfd-Expiry-Timestamp, X-Gnfd-Content-Sha256
+        //
+        // For PutObject, Go SDK uses: Content-Type, X-Gnfd-Expiry-Timestamp, X-Gnfd-Content-Sha256
+        // Headers must be sorted alphabetically (lowercase)
+        
+        // EmptyStringSHA256 - Go SDK uses this for PUT requests
+        const EMPTY_STRING_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        
+        // Canonical headers: "header:value\n" for each, then host at the end
+        // Sort order: content-type, x-gnfd-content-sha256, x-gnfd-expiry-timestamp (alphabetically sorted lowercase)
         let canonical_headers = format!(
-            "content-md5:{}\ncontent-type:{}\nx-gnfd-expiry-timestamp:{}\n{}\n",
-            content_md5, content_type, expiry, sp_host
+            "content-type:{}\nx-gnfd-content-sha256:{}\nx-gnfd-expiry-timestamp:{}\n{}\n",
+            content_type, EMPTY_STRING_SHA256, expiry, sp_host
         );
 
-        // 7. Build Signed Headers (semicolon-separated, sorted)
-        // These should match the headers used above (excluding host which is added separately)
-        let signed_headers = "content-md5;content-type;x-gnfd-expiry-timestamp";
+        // Signed headers (semicolon-separated, sorted)
+        let signed_headers = "content-type;x-gnfd-content-sha256;x-gnfd-expiry-timestamp";
 
-        // 8. Build Canonical Request (AWS S3 style)
-        // Format: Method\nPath\nQuery\nCanonicalHeaders\nSignedHeaders
+        // Build Canonical Request
+        // Go SDK uses strings.Join with "\n" separator, and canonical_headers already ends with "\n"
+        // So there are TWO "\n" between canonical_headers and signed_headers
         let canonical_request = format!(
-            "{}\n{}\n{}\n{}{}",
-            "PUT", url_path, raw_query, canonical_headers, signed_headers
+            "{}\n{}\n{}\n{}\n{}",
+            "PUT",           // Method
+            url_path,        // Encoded path (already properly encoded)
+            "",              // Raw query (empty for PUT)
+            canonical_headers,
+            signed_headers
         );
 
-        println!("Debug: Canonical Request:\n{}", canonical_request);
+        println!("📋 Canonical Request:\n{}", canonical_request);
 
-        // 9. Hash with Keccak-256
-        let hash = keccak256(canonical_request.as_bytes());
+        // 6. Hash with Keccak-256 (GNFD1-ECDSA uses raw keccak256, no checksum wrapper)
+        let msg_to_sign = keccak256(canonical_request.as_bytes());
+        println!("🔑 Message to sign: 0x{}", hex::encode(&msg_to_sign));
 
-        // 10. Sign with wallet
-        let signature = self.wallet.sign_hash(hash.into())?;
-        // The signature is [R || S || V] where V is 27 or 28
-        // Go's secp256k1.RecoverPubkey expects V to be 0 or 1
+        // 7. Sign with wallet
+        let signature = self.wallet.sign_hash(msg_to_sign.into())?;
+        // Convert V from 27/28 to 0/1 for recovery
         let mut sig_bytes = signature.to_vec();
-        sig_bytes[64] = sig_bytes[64] - 27; // Adjust V from 27/28 to 0/1
+        if sig_bytes[64] >= 27 {
+            sig_bytes[64] -= 27;
+        }
         let sig_hex = hex::encode(&sig_bytes);
 
-        // 11. Build Authorization header (GNFD1-ECDSA format)
-        let auth_header = format!("GNFD1-ECDSA,Signature={}", sig_hex);
+        // 8. Build Authorization header (GNFD1-ECDSA format: "GNFD1-ECDSA, Signature=<hex>")
+        let auth_header = format!("GNFD1-ECDSA, Signature={}", sig_hex);
 
-        println!("Debug: Authorization: {}", auth_header);
+        println!("🔐 Authorization: {}", auth_header);
 
-        // 12. Send PUT request to SP
+        // 9. Send PUT request to SP
         let url = format!("{}{}", sp_url, url_path);
+        println!("📤 PUT URL: {}", url);
 
         let resp = self
             .http_client
             .put(&url)
-            .header("Authorization", auth_header)
+            .header("Authorization", &auth_header)
             .header("Content-Type", content_type)
-            .header("Content-MD5", &content_md5)
+            .header("Content-Length", content_length.to_string())
+            .header("X-Gnfd-Content-Sha256", EMPTY_STRING_SHA256)
             .header("X-Gnfd-Expiry-Timestamp", &expiry)
-            .header("Host", &sp_host)
             .body(file_content)
             .send()
             .await?;
+            
         let status = resp.status();
         let text = resp.text().await?;
 
@@ -782,7 +832,78 @@ impl GreenfieldClient {
             return Err(format!("PUT failed with status {}: {}", status, text).into());
         }
 
+        println!("✅ Upload response: {}", if text.is_empty() { "(empty - success)" } else { &text });
         Ok(text)
+    }
+    
+    /// Query object upload status from SP (like Go SDK's getObjectStatusFromSP)
+    /// Uses GET /{bucket}/{object}?upload-progress
+    async fn get_object_status_from_sp(
+        &self,
+        sp_url: &str,
+        bucket: &str,
+        object: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{Duration, Utc};
+        use ethers::utils::keccak256;
+        
+        let sp_host = sp_url
+            .replace("https://", "")
+            .replace("http://", "")
+            .trim_end_matches('/')
+            .to_string();
+        
+        let url_path = format!("/{}/{}", bucket, object);
+        let raw_query = "upload-progress=";  // Query param to check upload progress
+        let url = format!("{}{}?upload-progress", sp_url, url_path);
+        
+        // Expiry timestamp
+        let expiry = (Utc::now() + Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        
+        // Build canonical request for GET with query param
+        let canonical_headers = format!(
+            "x-gnfd-expiry-timestamp:{}\n{}\n",
+            expiry, sp_host
+        );
+        let signed_headers = "x-gnfd-expiry-timestamp";
+        
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}{}",
+            "GET", url_path, raw_query, canonical_headers, signed_headers
+        );
+        
+        // Sign
+        let msg_to_sign = keccak256(canonical_request.as_bytes());
+        let signature = self.wallet.sign_hash(msg_to_sign.into())?;
+        let mut sig_bytes = signature.to_vec();
+        if sig_bytes[64] >= 27 {
+            sig_bytes[64] -= 27;
+        }
+        let auth_header = format!("GNFD1-ECDSA, Signature={}", hex::encode(&sig_bytes));
+        
+        // Send GET request
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", &auth_header)
+            .header("X-Gnfd-Expiry-Timestamp", &expiry)
+            .send()
+            .await?;
+        
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            // Check if it's "no such object" error - object not synced yet
+            if text.to_lowercase().contains("no such object") || text.contains("45002") {
+                Err("object has not been created".into())
+            } else {
+                Err(format!("GET object status failed ({}): {}", status, text).into())
+            }
+        }
     }
 
     /// Transfer BNB from BSC to Greenfield via TokenHub bridge contract
@@ -881,6 +1002,8 @@ impl GreenfieldClient {
 
     /// Combined operation: Create object on-chain and upload to SP
     /// This computes integrity hashes, creates object metadata on-chain, and uploads to SP
+    /// 
+    /// If sp_url is empty, it will be automatically fetched from the bucket's primary SP
     pub async fn upload(
         &self,
         sp_url: &str,
@@ -889,8 +1012,18 @@ impl GreenfieldClient {
         file_path: String,
         visibility: i32,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // 0. Get SP URL if not provided
+        let sp_endpoint = if sp_url.is_empty() {
+            println!("🔍 Fetching bucket's primary SP endpoint...");
+            let endpoint = crate::bucket::get_bucket_primary_sp(&self.rpc_url, &bucket).await?;
+            println!("   SP Endpoint: {}", endpoint);
+            endpoint
+        } else {
+            sp_url.to_string()
+        };
+        
         // 1. Create Object Metadata on-chain with checksums
-        println!("📝 Creating object metadata on-chain (computing checksums)...");
+        println!("\n📝 Step 1: Creating object metadata on-chain (computing checksums)...");
         let content_type = "application/octet-stream".to_string();
 
         let create_res = self
@@ -902,13 +1035,95 @@ impl GreenfieldClient {
                 visibility,
             )
             .await?;
-        println!("✅ On-chain metadata created: {}", create_res);
+        
+        // Parse tx hash from response
+        let tx_hash = Self::extract_tx_hash(&create_res)?;
+        println!("✅ Object metadata created! TxHash: {}", tx_hash);
 
         // 2. Upload file to Storage Provider
-        println!("📤 Uploading file to Storage Provider...");
-        let put_res = self.put_object(sp_url, bucket, object, file_path).await?;
+        println!("\n📤 Step 2: Uploading file to Storage Provider...");
+        let put_res = self.put_object(&sp_endpoint, bucket.clone(), object.clone(), file_path).await?;
+        println!("✅ File uploaded to SP!");
 
-        Ok(put_res)
+        // 3. Wait for object to be sealed (optional but recommended)
+        println!("\n⏳ Step 3: Waiting for object to be sealed...");
+        match self.wait_for_object_seal(&bucket, &object, 60).await {
+            Ok(_) => println!("✅ Object sealed successfully!"),
+            Err(e) => println!("⚠️  Seal check timed out or failed: {} (object may still be processing)", e),
+        }
+
+        Ok(format!("Upload complete! TxHash: {}, SP Response: {}", tx_hash, 
+            if put_res.is_empty() { "(empty)" } else { &put_res }))
+    }
+    
+    /// Extract tx_hash from broadcast response
+    fn extract_tx_hash(response: &str) -> Result<String, Box<dyn std::error::Error>> {
+        #[derive(serde::Deserialize)]
+        struct TxResp {
+            tx_response: Option<TxResponseInner>,
+        }
+        #[derive(serde::Deserialize)]
+        struct TxResponseInner {
+            txhash: Option<String>,
+        }
+        
+        let parsed: TxResp = serde_json::from_str(response)?;
+        parsed.tx_response
+            .and_then(|r| r.txhash)
+            .ok_or_else(|| "No txhash in response".into())
+    }
+    
+    /// Wait for object to be sealed on chain
+    pub async fn wait_for_object_seal(
+        &self,
+        bucket: &str,
+        object: &str,
+        timeout_secs: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::{Duration, Instant};
+        use tokio::time::sleep;
+        
+        let start = Instant::now();
+        let timeout = Duration::from_secs(timeout_secs);
+        
+        loop {
+            if start.elapsed() > timeout {
+                return Err("Timeout waiting for object seal".into());
+            }
+            
+            // Query object status
+            let url = format!(
+                "{}/greenfield/storage/head_object/{}/{}",
+                self.rpc_url, bucket, object
+            );
+            
+            let resp = self.http_client.get(&url).send().await?;
+            
+            if resp.status().is_success() {
+                #[derive(serde::Deserialize)]
+                struct ObjectResp {
+                    object_info: Option<ObjectInfoJson>,
+                }
+                #[derive(serde::Deserialize)]
+                struct ObjectInfoJson {
+                    object_status: Option<String>,
+                }
+                
+                if let Ok(data) = resp.json::<ObjectResp>().await {
+                    if let Some(info) = data.object_info {
+                        let status = info.object_status.unwrap_or_default();
+                        println!("   Object status: {}", status);
+                        
+                        if status == "OBJECT_STATUS_SEALED" {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            
+            // Wait before retry
+            sleep(Duration::from_secs(2)).await;
+        }
     }
 
     pub fn get_bech32_address(&self) -> String {

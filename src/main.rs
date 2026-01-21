@@ -58,9 +58,10 @@ enum Commands {
         file: PathBuf,
     },
     /// Upload file (creates metadata on-chain and uploads to SP)
+    /// If --sp-url is not provided, it will be auto-fetched from the bucket's primary SP
     Upload {
-        /// Storage Provider URL
-        #[arg(long, default_value = "https://gnfd-testnet-sp1.bnbchain.org")]
+        /// Storage Provider URL (optional, auto-detected from bucket if not provided)
+        #[arg(long, default_value = "")]
         sp_url: String,
         #[arg(short, long)]
         bucket: String,
@@ -68,7 +69,7 @@ enum Commands {
         object: String,
         #[arg(short, long)]
         file: PathBuf,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 2)]
         visibility: i32,
     },
     /// Upload file to Storage Provider
