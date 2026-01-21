@@ -1000,8 +1000,54 @@ impl GreenfieldClient {
         }
     }
 
+    /// Query object info from chain (HeadObject)
+    /// Returns (exists, status) where status is one of:
+    /// - "OBJECT_STATUS_CREATED" - Object metadata created, ready for upload
+    /// - "OBJECT_STATUS_SEALED" - Object fully uploaded and sealed
+    /// - "" - Object does not exist
+    pub async fn head_object(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<(bool, String), Box<dyn std::error::Error>> {
+        let url = format!(
+            "{}/greenfield/storage/head_object/{}/{}",
+            self.rpc_url, bucket, object
+        );
+        
+        let resp = self.http_client.get(&url).send().await?;
+        
+        if !resp.status().is_success() {
+            // Object doesn't exist
+            return Ok((false, String::new()));
+        }
+        
+        #[derive(serde::Deserialize)]
+        struct ObjectResp {
+            object_info: Option<ObjectInfoJson>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ObjectInfoJson {
+            object_status: Option<String>,
+        }
+        
+        let data: ObjectResp = resp.json().await?;
+        
+        if let Some(info) = data.object_info {
+            let status = info.object_status.unwrap_or_default();
+            Ok((true, status))
+        } else {
+            Ok((false, String::new()))
+        }
+    }
+
     /// Combined operation: Create object on-chain and upload to SP
     /// This computes integrity hashes, creates object metadata on-chain, and uploads to SP
+    /// 
+    /// **Behavior matching Go SDK:**
+    /// - If object doesn't exist: CreateObject → PutObject
+    /// - If object exists with status OBJECT_STATUS_CREATED: Skip CreateObject → PutObject  
+    /// - If object exists with status OBJECT_STATUS_SEALED: Return error (already uploaded)
     /// 
     /// If sp_url is empty, it will be automatically fetched from the bucket's primary SP
     pub async fn upload(
@@ -1022,23 +1068,50 @@ impl GreenfieldClient {
             sp_url.to_string()
         };
         
-        // 1. Create Object Metadata on-chain with checksums
-        println!("\n📝 Step 1: Creating object metadata on-chain (computing checksums)...");
-        let content_type = "application/octet-stream".to_string();
-
-        let create_res = self
-            .create_object_with_file(
-                bucket.clone(),
-                object.clone(),
-                &file_path,
-                content_type,
-                visibility,
-            )
-            .await?;
+        // 1. Check if object already exists (like Go SDK behavior)
+        println!("\n🔍 Step 1: Checking if object already exists...");
+        let (exists, status) = self.head_object(&bucket, &object).await?;
         
-        // Parse tx hash from response
-        let tx_hash = Self::extract_tx_hash(&create_res)?;
-        println!("✅ Object metadata created! TxHash: {}", tx_hash);
+        let tx_hash = if exists {
+            println!("   Object exists with status: {}", status);
+            
+            match status.as_str() {
+                "OBJECT_STATUS_SEALED" => {
+                    return Err(format!(
+                        "Object '{}/{}' is already sealed. Cannot re-upload a sealed object.",
+                        bucket, object
+                    ).into());
+                }
+                "OBJECT_STATUS_CREATED" => {
+                    println!("   ✓ Object metadata already exists, skipping CreateObject");
+                    println!("   (Object was previously created but not yet uploaded)");
+                    "existing".to_string()
+                }
+                _ => {
+                    println!("   ⚠️  Unexpected status '{}', attempting to continue...", status);
+                    "existing".to_string()
+                }
+            }
+        } else {
+            // Object doesn't exist, create it
+            println!("   Object does not exist, creating metadata on-chain...");
+            println!("\n📝 Step 1b: Creating object metadata (computing checksums)...");
+            let content_type = "application/octet-stream".to_string();
+
+            let create_res = self
+                .create_object_with_file(
+                    bucket.clone(),
+                    object.clone(),
+                    &file_path,
+                    content_type,
+                    visibility,
+                )
+                .await?;
+            
+            let hash = Self::extract_tx_hash(&create_res)?;
+            println!("✅ Object metadata created! TxHash: {}", hash);
+            hash
+        };
 
         // 2. Upload file to Storage Provider
         println!("\n📤 Step 2: Uploading file to Storage Provider...");
